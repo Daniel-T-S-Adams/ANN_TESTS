@@ -1,0 +1,6 @@
+numpy
+# Install ONE of the following (faiss-gpu requires CUDA):
+#   pip install faiss-gpu          # CUDA 11.x
+#   pip install faiss-gpu-cu12     # CUDA 12.x
+#   conda install -c pytorch faiss-gpu  # conda alternative
+faiss-gpu
