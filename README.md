@@ -1,6 +1,6 @@
 # ANN Benchmark
 
-Benchmarks brute-force vs HNSW nearest-neighbor search using FAISS.
+Benchmarks brute-force, HNSW, and CAGRA nearest-neighbor search using FAISS and cuVS.
 
 ## Setup
 
@@ -23,6 +23,27 @@ python download_data.py --dataset <DATASET>
 | `gist` | GIST1M | 960 | 1M | ~2.6 GB |
 
 Each dataset is stored under `data/<key>/` as `vectors.npy` + `dataset_info.json`.
+
+## Ground truth (recall measurement)
+
+To measure recall for approximate algorithms (HNSW, CAGRA), precompute exact nearest neighbors once per dataset:
+
+```bash
+python compute_ground_truth.py --dataset sift
+```
+
+This computes brute-force exact top-100 neighbors for **every vector** against the full dataset and saves to `data/<dataset>/ground_truth.npy`. Uses GPU if available.
+
+| Flag | Default | Description |
+|---|---|---|
+| `--dataset` | (required) | Dataset to compute ground truth for. |
+| `--gt-k` | 100 | Depth of exact neighbors to store. Must be >= any k used in benchmarks. |
+| `--batch-size` | 10000 | Vectors per search batch (tune for GPU memory). |
+| `--force` | false | Recompute even if file already exists. |
+
+At experiment time, for any query/database split (any seed), the precomputed neighbors are filtered to remove vectors that ended up in the query set, and the remaining neighbors are used to compute recall@k. With 1M vectors and ~1000 queries, filtering removes ~0.1 out of 100 neighbors on average — effectively zero.
+
+If ground truth has not been precomputed, benchmarks still run normally but print a warning and omit recall from results.
 
 ## Running benchmarks
 
@@ -58,6 +79,23 @@ Approximate search using FAISS `IndexHNSWFlat` (CPU only in FAISS).
 python run_benchmark.py --algorithm hnsw --dataset sift --hnsw-m 32 --hnsw-ef-construction 40 --hnsw-ef-search 64
 ```
 
+#### `cagra`
+
+Approximate search using NVIDIA CAGRA via cuVS (GPU only). Builds a graph index on GPU using an IVF-PQ-based construction algorithm, then searches it with a GPU-optimized traversal.
+
+**Times recorded:** `build_time_s` (index construction), `search_time_s`
+
+| Parameter | Flag | Default | Description |
+|---|---|---|---|
+| graph_degree | `--cagra-graph-degree` | 64 | Degree of the final optimized graph. Higher = better recall, more memory. |
+| intermediate_graph_degree | `--cagra-intermediate-graph-degree` | 128 | Degree of the intermediate kNN graph before pruning. Must be >= graph_degree. |
+| itopk_size | `--cagra-itopk-size` | 64 | Intermediate results retained during search. Higher = better recall, slower search. Must be >= k. |
+| build_algo | `--cagra-build-algo` | nn_descent | Graph construction algorithm: `nn_descent` (robust, recommended) or `ivf_pq` (faster but may overflow on large-magnitude vectors). |
+
+```bash
+python run_benchmark.py --algorithm cagra --dataset sift --cagra-graph-degree 64 --cagra-intermediate-graph-degree 128 --cagra-itopk-size 64
+```
+
 ### Common options
 
 | Flag | Default | Description |
@@ -79,6 +117,11 @@ python download_data.py --dataset gist
 python run_benchmark.py --algorithm hnsw --dataset gist --num-queries 500 --seeds 42 43 44 \
     --hnsw-m 64 --hnsw-ef-construction 100 --hnsw-ef-search 128 -k 20
 
+# CAGRA on SIFT with custom params
+python download_data.py --dataset sift
+python run_benchmark.py --algorithm cagra --dataset sift --num-queries 1000 --seeds 42 43 44 \
+    --cagra-graph-degree 32 --cagra-intermediate-graph-degree 64 --cagra-itopk-size 128
+
 # Compare across datasets
 python run_benchmark.py --algorithm brute_force --dataset glove --num-queries 1000 --seeds 42 43 44
 python run_benchmark.py --algorithm brute_force --dataset sift --num-queries 1000 --seeds 42 43 44
@@ -91,7 +134,7 @@ Each run writes a JSON file to `results/` with filename pattern:
 {algorithm}_{dataset}_nq{num_queries}_{num_seeds}seeds_{YYYYMMDD_HHMMSS}.json
 ```
 
-The JSON contains all experiment metadata (algorithm, dataset, parameters, device, seeds) and per-seed timings plus means. Example:
+The JSON contains all experiment metadata (algorithm, dataset, parameters, device, seeds) and per-seed timings plus means. For approximate algorithms, recall@k is included when ground truth is available. Example:
 
 ```json
 {
@@ -101,7 +144,7 @@ The JSON contains all experiment metadata (algorithm, dataset, parameters, devic
   "num_database_vectors": 999000,
   "num_queries": 1000,
   "k": 10,
-  "device": "cpu",
+  "device": "gpu",
   "seeds": [42, 43, 44],
   "num_seeds": 3,
   "parameters": {
@@ -110,12 +153,13 @@ The JSON contains all experiment metadata (algorithm, dataset, parameters, devic
     "efSearch": 64
   },
   "per_seed": [
-    {"seed": 42, "build_time_s": 12.3, "search_time_s": 0.05},
-    {"seed": 43, "build_time_s": 12.1, "search_time_s": 0.04},
-    {"seed": 44, "build_time_s": 12.5, "search_time_s": 0.06}
+    {"seed": 42, "build_time_s": 12.3, "search_time_s": 0.05, "recall_at_k": 0.9825},
+    {"seed": 43, "build_time_s": 12.1, "search_time_s": 0.04, "recall_at_k": 0.9810},
+    {"seed": 44, "build_time_s": 12.5, "search_time_s": 0.06, "recall_at_k": 0.9832}
   ],
   "mean_build_time_s": 12.3,
   "mean_search_time_s": 0.05,
+  "mean_recall_at_k": 0.9822,
   "timestamp": "2026-02-06T14:30:00"
 }
 ```
