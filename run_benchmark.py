@@ -14,6 +14,7 @@ Results are written as JSON files to the results/ directory.
 import argparse
 import json
 import os
+import sys
 import time
 from datetime import datetime
 
@@ -46,8 +47,19 @@ def load_data(dataset_key):
     return vectors, info
 
 
-def split_queries(vectors, num_queries, seed=42):
+def split_queries(vectors, num_queries, num_db=None, seed=42):
     """Randomly split the dataset into database vectors and query vectors.
+
+    Parameters
+    ----------
+    vectors : ndarray, shape (N, D)
+    num_queries : int
+        Number of vectors to hold out as queries (Q).
+    num_db : int or None
+        Number of vectors to use as the database (M).  If None, all remaining
+        vectors after the query hold-out are used (M = N - Q).
+    seed : int
+        Random seed for the permutation.
 
     Returns (database, queries, db_idx, query_idx) where db_idx and query_idx
     are the original row indices into the full vectors array.
@@ -55,62 +67,68 @@ def split_queries(vectors, num_queries, seed=42):
     rng = np.random.default_rng(seed)
     idx = rng.permutation(len(vectors))
     query_idx = idx[:num_queries]
-    db_idx = idx[num_queries:]
+    if num_db is None:
+        db_idx = idx[num_queries:]
+    else:
+        db_idx = idx[num_queries : num_queries + num_db]
     return vectors[db_idx].copy(), vectors[query_idx].copy(), db_idx, query_idx
 
 
-def load_ground_truth(dataset_key):
-    """Load precomputed ground truth indices, or return None if not found."""
-    filepath = os.path.join(DATA_DIR, dataset_key, "ground_truth.npy")
-    if not os.path.exists(filepath):
-        return None
-    return np.load(filepath)
+def estimate_recall(database, queries, approx_indices, k, sample_size, seed=42):
+    """Estimate recall@k by running brute-force exact search on a query sample.
 
-
-def compute_recall(gt_all, approx_indices, query_idx, db_idx, k):
-    """Compute mean recall@k using precomputed full-dataset ground truth.
-
-    For each query, looks up its precomputed neighbors in gt_all, filters out
-    any that are not in the database (i.e. are in the query set for this split),
-    and checks how many of the top-k true neighbors appear in the approximate
-    result (whose indices reference positions in the database array, not the
-    original dataset).
+    A random subset of queries is searched exactly against the database using
+    FAISS IndexFlatL2 (GPU if available).  The fraction of true top-k neighbors
+    found by the approximate algorithm is averaged over the sample.
 
     Parameters
     ----------
-    gt_all : ndarray, shape (num_total_vectors, gt_k)
-        Precomputed nearest neighbors for every vector (original dataset indices).
-    approx_indices : ndarray, shape (num_queries, k)
-        Indices returned by the approximate algorithm (database-local, 0-indexed).
-    query_idx : ndarray
-        Original dataset indices of the query vectors.
-    db_idx : ndarray
-        Original dataset indices of the database vectors.
+    database : ndarray, shape (M, D)
+    queries : ndarray, shape (Q, D)
+    approx_indices : ndarray, shape (Q, k)
+        Indices returned by the approximate algorithm (database-local).
     k : int
-        Number of neighbors to evaluate recall for.
+    sample_size : int
+        Number of queries to sample for recall estimation.
+    seed : int
+        Random seed for selecting the query sample.
+
+    Returns
+    -------
+    recall : float
+        Mean recall@k over the sampled queries.
+    num_sampled : int
+        Actual number of queries used (may be < sample_size if Q < sample_size).
     """
-    query_set = set(query_idx.tolist())
-    # Map database-local index -> original dataset index
-    # approx_indices[i][j] is position in the database array, db_idx maps that
-    # back to the original vector index.
-    num_queries = len(query_idx)
+    num_queries = len(queries)
+    sample_size = min(sample_size, num_queries)
+
+    if sample_size >= num_queries:
+        sample_idx = np.arange(num_queries)
+    else:
+        rng = np.random.default_rng(seed)
+        sample_idx = rng.choice(num_queries, size=sample_size, replace=False)
+
+    sample_queries = queries[sample_idx]
+
+    # Build exact-search index
+    d = database.shape[1]
+    if faiss.get_num_gpus() > 0:
+        res = faiss.StandardGpuResources()
+        index = faiss.GpuIndexFlatL2(res, d)
+    else:
+        index = faiss.IndexFlatL2(d)
+    index.add(database)
+
+    _distances, exact_indices = index.search(sample_queries, k)
+
     recall_sum = 0.0
-    for i in range(num_queries):
-        orig_query = query_idx[i]
-        # Get precomputed neighbors, filter out those in the query set
-        gt_neighbors = gt_all[orig_query]
-        filtered = [n for n in gt_neighbors if n not in query_set]
-        true_top_k = set(filtered[:k])
-        if len(true_top_k) < k:
-            # Not enough neighbors after filtering (very unlikely)
-            true_top_k_count = len(true_top_k)
-        else:
-            true_top_k_count = k
-        # Convert approximate results from database-local to original indices
-        approx_orig = set(db_idx[approx_indices[i]].tolist())
-        hits = len(true_top_k & approx_orig)
-        recall_sum += hits / true_top_k_count if true_top_k_count > 0 else 1.0
-    return recall_sum / num_queries
+    for i, qi in enumerate(sample_idx):
+        exact_set = set(exact_indices[i].tolist())
+        approx_set = set(approx_indices[qi].tolist())
+        recall_sum += len(exact_set & approx_set) / k
+
+    return recall_sum / len(sample_idx), len(sample_idx)
 
 
 # ---------------------------------------------------------------------------
@@ -243,6 +261,13 @@ def parse_args():
         help="Number of query vectors to hold out (default: 1000).",
     )
     p.add_argument(
+        "--num-db",
+        type=int,
+        default=None,
+        help="Number of database vectors to use. Must satisfy num-db + num-queries <= N. "
+             "If omitted, all remaining vectors after the query hold-out are used.",
+    )
+    p.add_argument(
         "--seeds",
         type=int,
         nargs="+",
@@ -254,6 +279,13 @@ def parse_args():
         type=int,
         default=10,
         help="Number of nearest neighbors to retrieve (default: 10).",
+    )
+    p.add_argument(
+        "--recall-sample",
+        type=int,
+        default=2000,
+        help="Number of queries to brute-force for recall estimation "
+             "(default: 2000, 0 to disable). Only used for approximate algorithms.",
     )
     # HNSW-specific
     p.add_argument("--hnsw-m", type=int, default=32, help="HNSW M (default: 32).")
@@ -304,10 +336,23 @@ def main():
     args = parse_args()
 
     vectors, info = load_data(args.dataset)
+    total = info["num_vectors"]
+
+    if args.num_queries > total:
+        print(f"Error: --num-queries ({args.num_queries}) exceeds dataset size ({total}).")
+        sys.exit(1)
+    if args.num_db is not None and args.num_db + args.num_queries > total:
+        print(f"Error: --num-db ({args.num_db}) + --num-queries ({args.num_queries}) "
+              f"exceeds dataset size ({total}).")
+        sys.exit(1)
+
+    num_db = args.num_db if args.num_db is not None else total - args.num_queries
+
     print(f"Dataset   : {info['name']}")
-    print(f"Vectors   : {info['num_vectors']}")
+    print(f"Vectors   : {total}")
     print(f"Dimension : {info['dimension']}")
     print(f"Algorithm : {args.algorithm}")
+    print(f"DB size   : {num_db}")
     print(f"Queries   : {args.num_queries}")
     print(f"k         : {args.k}")
     print(f"Seeds     : {args.seeds}")
@@ -318,21 +363,13 @@ def main():
     else:
         device = "gpu" if use_gpu else "cpu"
 
-    # --- Ground truth for recall ---
     is_approximate = args.algorithm in ("hnsw", "cagra")
-    gt_all = None
-    if is_approximate:
-        gt_all = load_ground_truth(args.dataset)
-        if gt_all is None:
-            print(f"\nWARNING: No ground truth found for dataset '{args.dataset}'. "
-                  f"Recall will not be computed.\n"
-                  f"Run: python compute_ground_truth.py --dataset {args.dataset}")
 
     per_seed = []
 
     for seed in args.seeds:
         database, queries, db_idx, query_idx = split_queries(
-            vectors, args.num_queries, seed=seed)
+            vectors, args.num_queries, num_db=args.num_db, seed=seed)
         print(f"\n--- seed {seed}  (db={database.shape[0]}, queries={queries.shape[0]}) ---")
 
         if args.algorithm == "brute_force":
@@ -355,10 +392,12 @@ def main():
                 "build_time_s": round(build_t, 6),
                 "search_time_s": round(search_t, 6),
             }
-            if gt_all is not None:
-                recall = compute_recall(gt_all, indices, query_idx, db_idx, args.k)
+            if args.recall_sample > 0:
+                recall, n_sampled = estimate_recall(
+                    database, queries, indices, args.k,
+                    args.recall_sample, seed=seed)
                 seed_result["recall_at_k"] = round(recall, 6)
-                print(f"  recall@{args.k}   : {recall:.4f}")
+                print(f"  recall@{args.k}   : {recall:.4f}  (sampled {n_sampled} queries)")
             per_seed.append(seed_result)
 
         elif args.algorithm == "cagra":
@@ -376,10 +415,12 @@ def main():
                 "build_time_s": round(build_t, 6),
                 "search_time_s": round(search_t, 6),
             }
-            if gt_all is not None:
-                recall = compute_recall(gt_all, indices, query_idx, db_idx, args.k)
+            if args.recall_sample > 0:
+                recall, n_sampled = estimate_recall(
+                    database, queries, indices, args.k,
+                    args.recall_sample, seed=seed)
                 seed_result["recall_at_k"] = round(recall, 6)
-                print(f"  recall@{args.k}   : {recall:.4f}")
+                print(f"  recall@{args.k}   : {recall:.4f}  (sampled {n_sampled} queries)")
             per_seed.append(seed_result)
 
     # --- Compute means ---
@@ -391,7 +432,7 @@ def main():
         "algorithm": args.algorithm,
         "dataset": info["name"],
         "dimension": info["dimension"],
-        "num_database_vectors": info["num_vectors"] - args.num_queries,
+        "num_database_vectors": num_db,
         "num_queries": args.num_queries,
         "k": args.k,
         "device": device,

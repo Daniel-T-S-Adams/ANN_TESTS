@@ -25,26 +25,11 @@ python download_data.py --dataset <DATASET>
 
 Each dataset is stored under `data/<key>/` as `vectors.npy` + `dataset_info.json`.
 
-## Ground truth (recall measurement)
+## Recall measurement
 
-To measure recall for approximate algorithms (HNSW, CAGRA), precompute exact nearest neighbors once per dataset:
+For approximate algorithms (HNSW, CAGRA), recall@k is estimated automatically at benchmark time by running brute-force exact search on a random sample of queries against the actual database. This avoids any precomputation step and works correctly regardless of database size (`--num-db`) or query count.
 
-```bash
-python compute_ground_truth.py --dataset sift
-```
-
-This computes brute-force exact top-100 neighbors for **every vector** against the full dataset and saves to `data/<dataset>/ground_truth.npy`. Uses GPU if available.
-
-| Flag | Default | Description |
-|---|---|---|
-| `--dataset` | (required) | Dataset to compute ground truth for. |
-| `--gt-k` | 100 | Depth of exact neighbors to store. Must be >= any k used in benchmarks. |
-| `--batch-size` | 10000 | Vectors per search batch (tune for GPU memory). |
-| `--force` | false | Recompute even if file already exists. |
-
-At experiment time, for any query/database split (any seed), the precomputed neighbors are filtered to remove vectors that ended up in the query set, and the remaining neighbors are used to compute recall@k. With 1M vectors and ~1000 queries, filtering removes ~0.1 out of 100 neighbors on average — effectively zero.
-
-If ground truth has not been precomputed, benchmarks still run normally but print a warning and omit recall from results.
+By default 2000 queries are sampled. Use `--recall-sample` to change the sample size, or `--recall-sample 0` to disable recall estimation entirely.
 
 ## Running benchmarks
 
@@ -102,9 +87,11 @@ python run_benchmark.py --algorithm cagra --dataset sift --cagra-graph-degree 64
 | Flag | Default | Description |
 |---|---|---|
 | `--dataset` | `glove` | Dataset to benchmark on (`glove`, `sift`, `gist`, `sift100m`). |
-| `--num-queries` | 1000 | Number of vectors held out as queries (rest become the database). |
+| `--num-queries` | 1000 | Number of vectors held out as queries (Q). |
+| `--num-db` | all remaining | Number of vectors to use as the database (M). Must satisfy M + Q <= N. If omitted, all non-query vectors are used. |
 | `--seeds` | 42 | One or more random seeds for the query/database split. Times are averaged over seeds. |
 | `-k` | 10 | Number of nearest neighbors to retrieve. |
+| `--recall-sample` | 2000 | Number of queries to brute-force for recall estimation (0 to disable). Only used for approximate algorithms. |
 
 ### Examples
 
@@ -135,7 +122,7 @@ Each run writes a JSON file to `results/` with filename pattern:
 {algorithm}_{dataset}_nq{num_queries}_{num_seeds}seeds_{YYYYMMDD_HHMMSS}.json
 ```
 
-The JSON contains all experiment metadata (algorithm, dataset, parameters, device, seeds) and per-seed timings plus means. For approximate algorithms, recall@k is included when ground truth is available. Example:
+The JSON contains all experiment metadata (algorithm, dataset, parameters, device, seeds) and per-seed timings plus means. For approximate algorithms, recall@k is included when `--recall-sample` > 0. Example:
 
 ```json
 {
