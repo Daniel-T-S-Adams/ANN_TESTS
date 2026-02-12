@@ -5,6 +5,7 @@ Usage:
     python download_data.py --dataset glove
     python download_data.py --dataset sift
     python download_data.py --dataset gist
+    python download_data.py --dataset sift100m
 
 Each dataset is stored under data/<dataset_key>/ as:
     vectors.npy        - float32 numpy array of shape (N, D)
@@ -12,6 +13,7 @@ Each dataset is stored under data/<dataset_key>/ as:
 """
 
 import argparse
+import gzip
 import json
 import os
 import sys
@@ -52,6 +54,15 @@ DATASETS = {
         "download_size": "~2.6 GB",
         "dimension": 960,
         "base_file": "gist/gist_base.fvecs",
+    },
+    "sift100m": {
+        "name": "SIFT100M",
+        "source": "ANN benchmark (INRIA TEXMEX corpus, BigANN first 100M)",
+        "url": "ftp://ftp.irisa.fr/local/texmex/corpus/bigann_base.bvecs.gz",
+        "archive": "bigann_base.bvecs.gz",
+        "download_size": "~26 GB",
+        "dimension": 128,
+        "num_vectors": 100_000_000,
     },
 }
 
@@ -95,6 +106,35 @@ def read_fvecs(fname):
     a = np.fromfile(fname, dtype=np.float32)
     d = a[0].view(np.int32)
     return a.reshape(-1, d + 1)[:, 1:].copy()
+
+
+def read_bvecs_gz(gz_path, num_vectors, dim):
+    """Read the first `num_vectors` from a gzipped .bvecs file as float32.
+
+    The .bvecs format stores each vector as: 4-byte int32 (dimension) followed
+    by `dim` uint8 values.  We stream-decompress to avoid extracting the full
+    file to disk.
+    """
+    record_size = 4 + dim
+    chunk_vecs = 10_000
+    result = np.empty((num_vectors, dim), dtype=np.float32)
+    read_count = 0
+
+    with gzip.open(gz_path, "rb") as f:
+        while read_count < num_vectors:
+            n = min(chunk_vecs, num_vectors - read_count)
+            raw = f.read(n * record_size)
+            actual = len(raw) // record_size
+            if actual == 0:
+                break
+            raw = raw[: actual * record_size]
+            chunk = np.frombuffer(raw, dtype=np.uint8).reshape(actual, record_size)
+            result[read_count : read_count + actual] = chunk[:, 4:].astype(np.float32)
+            read_count += actual
+            if read_count % 1_000_000 < chunk_vecs:
+                print(f"  Read {read_count:,} / {num_vectors:,} vectors...")
+
+    return result[:read_count]
 
 
 def save_dataset(out_dir, vectors, name, source):
@@ -182,6 +222,26 @@ def prepare_fvecs(out_dir, archive_path, dataset_key):
     save_dataset(out_dir, vectors, ds["name"], ds["source"])
 
 
+def prepare_sift100m(out_dir, archive_path):
+    """Extract first 100M vectors from BigANN .bvecs.gz and convert to npy."""
+    npy_path = os.path.join(out_dir, "vectors.npy")
+    if os.path.exists(npy_path):
+        print(f"Parsed data already exists at {npy_path}, skipping.")
+        return
+
+    ds = DATASETS["sift100m"]
+    num_vectors = ds["num_vectors"]
+    dim = ds["dimension"]
+
+    ram_gb = num_vectors * dim * 4 / 1e9
+    print(f"Reading first {num_vectors:,} vectors from {archive_path} ...")
+    print(f"  (This requires ~{ram_gb:.0f} GB of RAM for the float32 array)")
+    vectors = read_bvecs_gz(archive_path, num_vectors, dim)
+    print(f"  Total vectors: {vectors.shape[0]:,}, dimension: {vectors.shape[1]}")
+
+    save_dataset(out_dir, vectors, ds["name"], ds["source"])
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -206,6 +266,8 @@ def main():
 
     if args.dataset == "glove":
         prepare_glove(out_dir, archive_path)
+    elif args.dataset == "sift100m":
+        prepare_sift100m(out_dir, archive_path)
     else:
         prepare_fvecs(out_dir, archive_path, args.dataset)
 

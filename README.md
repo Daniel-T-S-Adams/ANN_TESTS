@@ -21,6 +21,7 @@ python download_data.py --dataset <DATASET>
 | `glove` | GloVe 6B 100d | 100 | ~400K | ~862 MB |
 | `sift` | SIFT1M | 128 | 1M | ~500 MB |
 | `gist` | GIST1M | 960 | 1M | ~2.6 GB |
+| `sift100m` | SIFT100M | 128 | 100M | ~26 GB |
 
 Each dataset is stored under `data/<key>/` as `vectors.npy` + `dataset_info.json`.
 
@@ -100,7 +101,7 @@ python run_benchmark.py --algorithm cagra --dataset sift --cagra-graph-degree 64
 
 | Flag | Default | Description |
 |---|---|---|
-| `--dataset` | `glove` | Dataset to benchmark on (`glove`, `sift`, `gist`). |
+| `--dataset` | `glove` | Dataset to benchmark on (`glove`, `sift`, `gist`, `sift100m`). |
 | `--num-queries` | 1000 | Number of vectors held out as queries (rest become the database). |
 | `--seeds` | 42 | One or more random seeds for the query/database split. Times are averaged over seeds. |
 | `-k` | 10 | Number of nearest neighbors to retrieve. |

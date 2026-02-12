@@ -26,7 +26,7 @@ import numpy as np
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
 RESULTS_DIR = os.path.join(os.path.dirname(__file__), "results")
 
-AVAILABLE_DATASETS = ["glove", "sift", "gist"]
+AVAILABLE_DATASETS = ["glove", "sift", "gist", "sift100m"]
 
 
 # ---------------------------------------------------------------------------
