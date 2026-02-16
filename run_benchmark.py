@@ -5,6 +5,8 @@ Usage examples:
     python run_benchmark.py --algorithm brute_force --dataset sift --num-queries 1000 --seeds 42 43 44
     python run_benchmark.py --algorithm hnsw --dataset glove --num-queries 500 --seeds 42 43 44 \
         --hnsw-m 32 --hnsw-ef-construction 40 --hnsw-ef-search 64
+    python run_benchmark.py --algorithm ivf_flat --dataset sift --num-queries 1000 --seeds 42 43 44 \
+        --ivf-nlist 100 --ivf-nprobe 10
     python run_benchmark.py --algorithm cagra --dataset sift --num-queries 1000 --seeds 42 43 44 \
         --cagra-graph-degree 64 --cagra-intermediate-graph-degree 128 --cagra-itopk-size 64
 
@@ -111,12 +113,16 @@ def estimate_recall(database, queries, approx_indices, k, sample_size, seed=42):
 
     sample_queries = queries[sample_idx]
 
-    # Build exact-search index
+    # Build exact-search index (GPU if possible, CPU fallback on OOM)
     d = database.shape[1]
+    index = None
     if faiss.get_num_gpus() > 0:
-        res = faiss.StandardGpuResources()
-        index = faiss.GpuIndexFlatL2(res, d)
-    else:
+        try:
+            res = faiss.StandardGpuResources()
+            index = faiss.GpuIndexFlatL2(res, d)
+        except RuntimeError:
+            index = None
+    if index is None:
         index = faiss.IndexFlatL2(d)
     index.add(database)
 
@@ -196,6 +202,38 @@ def hnsw_search(database, queries, k, M, ef_construction, ef_search):
 
 
 # ---------------------------------------------------------------------------
+# IVF-Flat (inverted file, GPU via FAISS)
+# ---------------------------------------------------------------------------
+def ivf_flat_search(database, queries, k, nlist, nprobe):
+    d = database.shape[1]
+
+    # Build a flat quantizer and the IVF index on GPU
+    res = faiss.StandardGpuResources()
+    quantizer = faiss.IndexFlatL2(d)
+    cpu_index = faiss.IndexIVFFlat(quantizer, d, nlist)
+
+    gpu_index = faiss.index_cpu_to_gpu(res, 0, cpu_index)
+
+    # --- train + build ---
+    t0 = time.perf_counter()
+    gpu_index.train(database)
+    gpu_index.add(database)
+    build_time = time.perf_counter() - t0
+
+    # --- search ---
+    gpu_index.nprobe = nprobe
+
+    # warm-up
+    gpu_index.search(queries[:1], k)
+
+    t0 = time.perf_counter()
+    _distances, indices = gpu_index.search(queries, k)
+    search_time = time.perf_counter() - t0
+
+    return build_time, search_time, indices
+
+
+# ---------------------------------------------------------------------------
 # CAGRA (graph-based, GPU, via cuVS)
 # ---------------------------------------------------------------------------
 def cagra_search(database, queries, k, graph_degree, intermediate_graph_degree,
@@ -245,7 +283,7 @@ def parse_args():
     p.add_argument(
         "--algorithm",
         required=True,
-        choices=["brute_force", "hnsw", "cagra"],
+        choices=["brute_force", "hnsw", "ivf_flat", "cagra"],
         help="Algorithm to benchmark.",
     )
     p.add_argument(
@@ -300,6 +338,19 @@ def parse_args():
         type=int,
         default=64,
         help="HNSW efSearch (default: 64).",
+    )
+    # IVF-Flat-specific
+    p.add_argument(
+        "--ivf-nlist",
+        type=int,
+        default=100,
+        help="IVF-Flat number of Voronoi cells / clusters (default: 100).",
+    )
+    p.add_argument(
+        "--ivf-nprobe",
+        type=int,
+        default=10,
+        help="IVF-Flat number of cells to visit during search (default: 10).",
     )
     # CAGRA-specific
     p.add_argument(
@@ -358,12 +409,16 @@ def main():
     print(f"Seeds     : {args.seeds}")
 
     use_gpu = faiss.get_num_gpus() > 0
-    if args.algorithm == "cagra":
+    if args.algorithm in ("cagra", "ivf_flat"):
         device = "gpu"
     else:
         device = "gpu" if use_gpu else "cpu"
 
-    is_approximate = args.algorithm in ("hnsw", "cagra")
+    if args.algorithm == "ivf_flat" and not use_gpu:
+        print("Error: ivf_flat requires a GPU but none was detected.")
+        sys.exit(1)
+
+    is_approximate = args.algorithm in ("hnsw", "ivf_flat", "cagra")
 
     per_seed = []
 
@@ -384,6 +439,26 @@ def main():
             build_t, search_t, indices = hnsw_search(
                 database, queries, args.k,
                 args.hnsw_m, args.hnsw_ef_construction, args.hnsw_ef_search,
+            )
+            print(f"  build_time : {build_t:.4f} s")
+            print(f"  search_time: {search_t:.4f} s")
+            seed_result = {
+                "seed": seed,
+                "build_time_s": round(build_t, 6),
+                "search_time_s": round(search_t, 6),
+            }
+            if args.recall_sample > 0:
+                recall, n_sampled = estimate_recall(
+                    database, queries, indices, args.k,
+                    args.recall_sample, seed=seed)
+                seed_result["recall_at_k"] = round(recall, 6)
+                print(f"  recall@{args.k}   : {recall:.4f}  (sampled {n_sampled} queries)")
+            per_seed.append(seed_result)
+
+        elif args.algorithm == "ivf_flat":
+            build_t, search_t, indices = ivf_flat_search(
+                database, queries, args.k,
+                args.ivf_nlist, args.ivf_nprobe,
             )
             print(f"  build_time : {build_t:.4f} s")
             print(f"  search_time: {search_t:.4f} s")
@@ -452,6 +527,14 @@ def main():
         mean_build = sum(r["build_time_s"] for r in per_seed) / len(per_seed)
         result["mean_build_time_s"] = round(mean_build, 6)
 
+    elif args.algorithm == "ivf_flat":
+        result["parameters"] = {
+            "nlist": args.ivf_nlist,
+            "nprobe": args.ivf_nprobe,
+        }
+        mean_build = sum(r["build_time_s"] for r in per_seed) / len(per_seed)
+        result["mean_build_time_s"] = round(mean_build, 6)
+
     elif args.algorithm == "cagra":
         result["parameters"] = {
             "graph_degree": args.cagra_graph_degree,
@@ -468,7 +551,7 @@ def main():
     # --- Print summary ---
     print(f"\n{'=' * 50}")
     print(f"  Mean search time : {mean_search:.4f} s")
-    if args.algorithm in ("hnsw", "cagra"):
+    if args.algorithm in ("hnsw", "ivf_flat", "cagra"):
         print(f"  Mean build time  : {mean_build:.4f} s")
     if mean_recall is not None:
         print(f"  Mean recall@{args.k}   : {mean_recall:.4f}")
@@ -477,7 +560,7 @@ def main():
     # --- Write result file ---
     os.makedirs(RESULTS_DIR, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = f"{args.algorithm}_{args.dataset}_nq{args.num_queries}_{len(args.seeds)}seeds_{ts}.json"
+    filename = f"{args.algorithm}_{args.dataset}_db{num_db}_nq{args.num_queries}_{ts}.json"
     filepath = os.path.join(RESULTS_DIR, filename)
 
     with open(filepath, "w") as f:

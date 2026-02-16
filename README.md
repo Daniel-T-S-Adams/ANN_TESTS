@@ -21,7 +21,7 @@ python download_data.py --dataset <DATASET>
 | `glove` | GloVe 6B 100d | 100 | ~400K | ~862 MB |
 | `sift` | SIFT1M | 128 | 1M | ~500 MB |
 | `gist` | GIST1M | 960 | 1M | ~2.6 GB |
-| `sift100m` | SIFT100M | 128 | 100M | ~26 GB |
+| `sift100m` | SIFT100M | 128 | 100M | ~10 GB |
 
 Each dataset is stored under `data/<key>/` as `vectors.npy` + `dataset_info.json`.
 
