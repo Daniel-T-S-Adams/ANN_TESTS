@@ -5,6 +5,7 @@ Usage:
     python download_data.py --dataset glove
     python download_data.py --dataset sift
     python download_data.py --dataset gist
+    python download_data.py --dataset sift10m
     python download_data.py --dataset sift100m
 
 Each dataset is stored under data/<dataset_key>/ as:
@@ -64,6 +65,15 @@ DATASETS = {
         "dimension": 128,
         "num_vectors": 100_000_000,
     },
+    "sift10m": {
+        "name": "SIFT10M",
+        "source": "ANN benchmark (INRIA TEXMEX corpus, BigANN learn set subset)",
+        "url": "https://huggingface.co/datasets/jkhe/bigann/resolve/main/bigann_learn.bvecs.gz?download=true",
+        "archive": "bigann_learn.bvecs.gz",
+        "download_size": "~10 GB",
+        "dimension": 128,
+        "num_vectors": 10_000_000,
+    },
 }
 
 
@@ -108,16 +118,18 @@ def read_fvecs(fname):
     return a.reshape(-1, d + 1)[:, 1:].copy()
 
 
-def read_bvecs_gz(gz_path, num_vectors, dim):
-    """Read the first `num_vectors` from a gzipped .bvecs file as float32.
+def stream_bvecs_gz_to_npy(gz_path, npy_path, num_vectors, dim):
+    """Stream `num_vectors` from gzipped .bvecs into a float32 .npy file.
 
     The .bvecs format stores each vector as: 4-byte int32 (dimension) followed
     by `dim` uint8 values.  We stream-decompress to avoid extracting the full
-    file to disk.
+    file to disk and write directly into an on-disk memmap.
     """
     record_size = 4 + dim
-    chunk_vecs = 10_000
-    result = np.empty((num_vectors, dim), dtype=np.float32)
+    chunk_vecs = 100_000
+    out = np.lib.format.open_memmap(
+        npy_path, mode="w+", dtype=np.float32, shape=(num_vectors, dim)
+    )
     read_count = 0
 
     with gzip.open(gz_path, "rb") as f:
@@ -129,12 +141,30 @@ def read_bvecs_gz(gz_path, num_vectors, dim):
                 break
             raw = raw[: actual * record_size]
             chunk = np.frombuffer(raw, dtype=np.uint8).reshape(actual, record_size)
-            result[read_count : read_count + actual] = chunk[:, 4:].astype(np.float32)
+            out[read_count : read_count + actual] = chunk[:, 4:].astype(
+                np.float32, copy=False
+            )
             read_count += actual
-            if read_count % 1_000_000 < chunk_vecs:
+            if read_count % 1_000_000 < actual:
                 print(f"  Read {read_count:,} / {num_vectors:,} vectors...")
 
-    return result[:read_count]
+    out.flush()
+    del out
+    return read_count
+
+
+def save_dataset_info(out_dir, name, source, num_vectors, dimension):
+    info = {
+        "name": name,
+        "source": source,
+        "num_vectors": int(num_vectors),
+        "dimension": int(dimension),
+        "dtype": "float32",
+    }
+    info_path = os.path.join(out_dir, "dataset_info.json")
+    with open(info_path, "w") as f:
+        json.dump(info, f, indent=2)
+    print(f"  Saved metadata -> {info_path}")
 
 
 def save_dataset(out_dir, vectors, name, source):
@@ -142,18 +172,7 @@ def save_dataset(out_dir, vectors, name, source):
     npy_path = os.path.join(out_dir, "vectors.npy")
     np.save(npy_path, vectors)
     print(f"  Saved vectors  -> {npy_path}  (shape {vectors.shape})")
-
-    info = {
-        "name": name,
-        "source": source,
-        "num_vectors": int(vectors.shape[0]),
-        "dimension": int(vectors.shape[1]),
-        "dtype": "float32",
-    }
-    info_path = os.path.join(out_dir, "dataset_info.json")
-    with open(info_path, "w") as f:
-        json.dump(info, f, indent=2)
-    print(f"  Saved metadata -> {info_path}")
+    save_dataset_info(out_dir, name, source, vectors.shape[0], vectors.shape[1])
 
 
 # ---------------------------------------------------------------------------
@@ -222,24 +241,32 @@ def prepare_fvecs(out_dir, archive_path, dataset_key):
     save_dataset(out_dir, vectors, ds["name"], ds["source"])
 
 
-def prepare_sift100m(out_dir, archive_path):
-    """Extract first 100M vectors from BigANN .bvecs.gz and convert to npy."""
+def prepare_bigann_subset(out_dir, archive_path, dataset_key):
+    """Extract a BigANN subset from .bvecs.gz and write vectors.npy via streaming."""
     npy_path = os.path.join(out_dir, "vectors.npy")
     if os.path.exists(npy_path):
         print(f"Parsed data already exists at {npy_path}, skipping.")
         return
 
-    ds = DATASETS["sift100m"]
+    ds = DATASETS[dataset_key]
     num_vectors = ds["num_vectors"]
     dim = ds["dimension"]
 
-    ram_gb = num_vectors * dim * 4 / 1e9
+    disk_gb = num_vectors * dim * 4 / 1e9
     print(f"Reading first {num_vectors:,} vectors from {archive_path} ...")
-    print(f"  (This requires ~{ram_gb:.0f} GB of RAM for the float32 array)")
-    vectors = read_bvecs_gz(archive_path, num_vectors, dim)
-    print(f"  Total vectors: {vectors.shape[0]:,}, dimension: {vectors.shape[1]}")
+    print(f"  Writing directly to {npy_path} (~{disk_gb:.1f} GB float32 data)")
+    read_count = stream_bvecs_gz_to_npy(archive_path, npy_path, num_vectors, dim)
+    if read_count != num_vectors:
+        if os.path.exists(npy_path):
+            os.remove(npy_path)
+        print(
+            f"Error: requested {num_vectors:,} vectors but only read {read_count:,} "
+            f"from {archive_path}."
+        )
+        sys.exit(1)
 
-    save_dataset(out_dir, vectors, ds["name"], ds["source"])
+    print(f"  Saved vectors  -> {npy_path}  (shape ({read_count}, {dim}))")
+    save_dataset_info(out_dir, ds["name"], ds["source"], read_count, dim)
 
 
 # ---------------------------------------------------------------------------
@@ -261,13 +288,16 @@ def main():
     out_dir = os.path.join(DATA_DIR, args.dataset)
     os.makedirs(out_dir, exist_ok=True)
 
-    archive_path = os.path.join(out_dir, ds["archive"])
+    if args.dataset in ("sift10m", "sift100m"):
+        archive_path = os.path.join(DATA_DIR, ds["archive"])
+    else:
+        archive_path = os.path.join(out_dir, ds["archive"])
     download_file(ds["url"], archive_path, size_hint=ds["download_size"])
 
     if args.dataset == "glove":
         prepare_glove(out_dir, archive_path)
-    elif args.dataset == "sift100m":
-        prepare_sift100m(out_dir, archive_path)
+    elif args.dataset in ("sift10m", "sift100m"):
+        prepare_bigann_subset(out_dir, archive_path, args.dataset)
     else:
         prepare_fvecs(out_dir, archive_path, args.dataset)
 

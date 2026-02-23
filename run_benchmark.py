@@ -17,6 +17,7 @@ import argparse
 import json
 import os
 import sys
+import threading
 import time
 from datetime import datetime
 
@@ -29,13 +30,13 @@ import numpy as np
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
 RESULTS_DIR = os.path.join(os.path.dirname(__file__), "results")
 
-AVAILABLE_DATASETS = ["glove", "sift", "gist", "sift100m"]
+AVAILABLE_DATASETS = ["glove", "sift", "gist", "sift10m", "sift100m"]
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-def load_data(dataset_key):
+def load_data(dataset_key, mmap_mode=None):
     dataset_dir = os.path.join(DATA_DIR, dataset_key)
     vectors_file = os.path.join(dataset_dir, "vectors.npy")
     info_file = os.path.join(dataset_dir, "dataset_info.json")
@@ -45,7 +46,7 @@ def load_data(dataset_key):
         )
     with open(info_file) as f:
         info = json.load(f)
-    vectors = np.load(vectors_file)
+    vectors = np.load(vectors_file, mmap_mode=mmap_mode)
     return vectors, info
 
 
@@ -66,14 +67,35 @@ def split_queries(vectors, num_queries, num_db=None, seed=42):
     Returns (database, queries, db_idx, query_idx) where db_idx and query_idx
     are the original row indices into the full vectors array.
     """
+    total = len(vectors)
     rng = np.random.default_rng(seed)
-    idx = rng.permutation(len(vectors))
-    query_idx = idx[:num_queries]
+
     if num_db is None:
+        idx = rng.permutation(total)
+        query_idx = idx[:num_queries]
         db_idx = idx[num_queries:]
     else:
-        db_idx = idx[num_queries : num_queries + num_db]
-    return vectors[db_idx].copy(), vectors[query_idx].copy(), db_idx, query_idx
+        sample_size = num_queries + num_db
+        if sample_size > total:
+            raise ValueError(
+                f"num_db + num_queries ({sample_size}) exceeds dataset size ({total})"
+            )
+        if sample_size == total and num_queries == 0:
+            # Fast path for build-only runs that use the full dataset.
+            query_idx = np.empty((0,), dtype=np.int64)
+            db_idx = np.arange(total, dtype=np.int64)
+        elif sample_size == total:
+            idx = rng.permutation(total)
+            query_idx = idx[:num_queries]
+            db_idx = idx[num_queries:]
+        else:
+            idx = rng.choice(total, size=sample_size, replace=False)
+            query_idx = idx[:num_queries]
+            db_idx = idx[num_queries:]
+
+    database = np.asarray(vectors[db_idx], dtype=np.float32).copy()
+    queries = np.asarray(vectors[query_idx], dtype=np.float32).copy()
+    return database, queries, db_idx, query_idx
 
 
 def estimate_recall(database, queries, approx_indices, k, sample_size, seed=42):
@@ -137,6 +159,45 @@ def estimate_recall(database, queries, approx_indices, k, sample_size, seed=42):
     return recall_sum / len(sample_idx), len(sample_idx)
 
 
+def gpu_used_memory_bytes(cp, device_id=0):
+    with cp.cuda.Device(device_id):
+        free_bytes, total_bytes = cp.cuda.runtime.memGetInfo()
+    return int(total_bytes - free_bytes)
+
+
+class CudaMemorySampler:
+    """Sample GPU memory usage during build to estimate peak temporary usage."""
+
+    def __init__(self, cp, device_id=0, interval_s=0.01):
+        self.cp = cp
+        self.device_id = device_id
+        self.interval_s = interval_s
+        self.peak_used_bytes = 0
+        self._stop = threading.Event()
+        self._thread = None
+
+    def _sample_once(self):
+        used = gpu_used_memory_bytes(self.cp, self.device_id)
+        if used > self.peak_used_bytes:
+            self.peak_used_bytes = used
+
+    def _run(self):
+        while not self._stop.is_set():
+            self._sample_once()
+            time.sleep(self.interval_s)
+
+    def start(self):
+        self._sample_once()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join()
+        self._sample_once()
+
+
 # ---------------------------------------------------------------------------
 # Brute-force (GPU)
 # ---------------------------------------------------------------------------
@@ -177,7 +238,7 @@ def brute_force_cpu(database, queries, k):
 # ---------------------------------------------------------------------------
 # HNSW (graph-based, CPU only in FAISS)
 # ---------------------------------------------------------------------------
-def hnsw_search(database, queries, k, M, ef_construction, ef_search):
+def hnsw_search(database, queries, k, M, ef_construction, ef_search, run_search=True):
     d = database.shape[1]
 
     index = faiss.IndexHNSWFlat(d, M)
@@ -187,6 +248,9 @@ def hnsw_search(database, queries, k, M, ef_construction, ef_search):
     t0 = time.perf_counter()
     index.add(database)
     build_time = time.perf_counter() - t0
+
+    if not run_search:
+        return build_time, None, None
 
     # --- search ---
     index.hnsw.efSearch = ef_search
@@ -204,7 +268,7 @@ def hnsw_search(database, queries, k, M, ef_construction, ef_search):
 # ---------------------------------------------------------------------------
 # IVF-Flat (inverted file, GPU via FAISS)
 # ---------------------------------------------------------------------------
-def ivf_flat_search(database, queries, k, nlist, nprobe):
+def ivf_flat_search(database, queries, k, nlist, nprobe, run_search=True):
     d = database.shape[1]
 
     # Build a flat quantizer and the IVF index on GPU
@@ -219,6 +283,9 @@ def ivf_flat_search(database, queries, k, nlist, nprobe):
     gpu_index.train(database)
     gpu_index.add(database)
     build_time = time.perf_counter() - t0
+
+    if not run_search:
+        return build_time, None, None
 
     # --- search ---
     gpu_index.nprobe = nprobe
@@ -237,12 +304,12 @@ def ivf_flat_search(database, queries, k, nlist, nprobe):
 # CAGRA (graph-based, GPU, via cuVS)
 # ---------------------------------------------------------------------------
 def cagra_search(database, queries, k, graph_degree, intermediate_graph_degree,
-                 itopk_size, build_algo):
+                 itopk_size, build_algo, run_search=True, track_memory=True):
     import cupy as cp
     from cuvs.neighbors import cagra
 
     database_gpu = cp.asarray(database)
-    queries_gpu = cp.asarray(queries)
+    cp.cuda.Device(0).synchronize()
 
     build_params = cagra.IndexParams(
         metric="sqeuclidean",
@@ -251,11 +318,38 @@ def cagra_search(database, queries, k, graph_degree, intermediate_graph_degree,
         build_algo=build_algo,
     )
 
+    sampler = None
+    memory_stats = {}
+    if track_memory:
+        memory_before_build = gpu_used_memory_bytes(cp, device_id=0)
+        sampler = CudaMemorySampler(cp, device_id=0)
+        sampler.start()
+
     # --- index build ---
     t0 = time.perf_counter()
     index = cagra.build(build_params, database_gpu)
     cp.cuda.Device(0).synchronize()
     build_time = time.perf_counter() - t0
+
+    if sampler is not None:
+        sampler.stop()
+        memory_after_build = gpu_used_memory_bytes(cp, device_id=0)
+        peak_build_used = max(memory_after_build, sampler.peak_used_bytes)
+        memory_stats = {
+            "gpu_memory_before_build_bytes": int(memory_before_build),
+            "gpu_memory_after_build_bytes": int(memory_after_build),
+            "index_memory_bytes": int(max(0, memory_after_build - memory_before_build)),
+            "peak_build_memory_bytes": int(max(0, peak_build_used - memory_before_build)),
+        }
+
+    if not run_search:
+        del index
+        del database_gpu
+        cp.get_default_memory_pool().free_all_blocks()
+        cp.get_default_pinned_memory_pool().free_all_blocks()
+        return build_time, None, None, memory_stats
+
+    queries_gpu = cp.asarray(queries)
 
     # --- search ---
     search_params = cagra.SearchParams(itopk_size=itopk_size)
@@ -270,7 +364,13 @@ def cagra_search(database, queries, k, graph_degree, intermediate_graph_degree,
     search_time = time.perf_counter() - t0
 
     indices = cp.asnumpy(cp.asarray(neighbors))
-    return build_time, search_time, indices
+    del neighbors
+    del index
+    del queries_gpu
+    del database_gpu
+    cp.get_default_memory_pool().free_all_blocks()
+    cp.get_default_pinned_memory_pool().free_all_blocks()
+    return build_time, search_time, indices, memory_stats
 
 
 # ---------------------------------------------------------------------------
@@ -324,6 +424,11 @@ def parse_args():
         default=2000,
         help="Number of queries to brute-force for recall estimation "
              "(default: 2000, 0 to disable). Only used for approximate algorithms.",
+    )
+    p.add_argument(
+        "--build-only",
+        action="store_true",
+        help="Only build the index and skip search and recall measurement.",
     )
     # HNSW-specific
     p.add_argument("--hnsw-m", type=int, default=32, help="HNSW M (default: 32).")
@@ -389,20 +494,38 @@ def main():
     vectors, info = load_data(args.dataset)
     total = info["num_vectors"]
 
+    if args.num_queries < 0:
+        print("Error: --num-queries must be >= 0.")
+        sys.exit(1)
     if args.num_queries > total:
         print(f"Error: --num-queries ({args.num_queries}) exceeds dataset size ({total}).")
+        sys.exit(1)
+    if args.num_db is not None and args.num_db <= 0:
+        print("Error: --num-db must be > 0 when provided.")
         sys.exit(1)
     if args.num_db is not None and args.num_db + args.num_queries > total:
         print(f"Error: --num-db ({args.num_db}) + --num-queries ({args.num_queries}) "
               f"exceeds dataset size ({total}).")
         sys.exit(1)
+    if args.algorithm == "brute_force" and args.build_only:
+        print("Error: --build-only is not supported with brute_force (no index build phase).")
+        sys.exit(1)
+    if args.algorithm == "cagra" and args.cagra_intermediate_graph_degree < args.cagra_graph_degree:
+        print("Error: --cagra-intermediate-graph-degree must be >= --cagra-graph-degree.")
+        sys.exit(1)
+    if args.algorithm == "cagra" and (not args.build_only) and args.cagra_itopk_size < args.k:
+        print("Error: --cagra-itopk-size must be >= k for CAGRA search.")
+        sys.exit(1)
 
     num_db = args.num_db if args.num_db is not None else total - args.num_queries
+    run_search = not args.build_only
+    recall_sample = 0 if args.build_only else args.recall_sample
 
     print(f"Dataset   : {info['name']}")
     print(f"Vectors   : {total}")
     print(f"Dimension : {info['dimension']}")
     print(f"Algorithm : {args.algorithm}")
+    print(f"Mode      : {'build_only' if args.build_only else 'build_and_search'}")
     print(f"DB size   : {num_db}")
     print(f"Queries   : {args.num_queries}")
     print(f"k         : {args.k}")
@@ -414,11 +537,12 @@ def main():
     else:
         device = "gpu" if use_gpu else "cpu"
 
-    if args.algorithm == "ivf_flat" and not use_gpu:
-        print("Error: ivf_flat requires a GPU but none was detected.")
+    if args.algorithm in ("ivf_flat", "cagra") and not use_gpu:
+        print(f"Error: {args.algorithm} requires a GPU but none was detected.")
         sys.exit(1)
 
-    is_approximate = args.algorithm in ("hnsw", "ivf_flat", "cagra")
+    if args.build_only and args.recall_sample > 0:
+        print("Note: --build-only ignores recall; forcing recall sample size to 0.")
 
     per_seed = []
 
@@ -439,18 +563,20 @@ def main():
             build_t, search_t, indices = hnsw_search(
                 database, queries, args.k,
                 args.hnsw_m, args.hnsw_ef_construction, args.hnsw_ef_search,
+                run_search=run_search,
             )
             print(f"  build_time : {build_t:.4f} s")
-            print(f"  search_time: {search_t:.4f} s")
             seed_result = {
                 "seed": seed,
                 "build_time_s": round(build_t, 6),
-                "search_time_s": round(search_t, 6),
             }
-            if args.recall_sample > 0:
+            if run_search:
+                print(f"  search_time: {search_t:.4f} s")
+                seed_result["search_time_s"] = round(search_t, 6)
+            if run_search and recall_sample > 0:
                 recall, n_sampled = estimate_recall(
                     database, queries, indices, args.k,
-                    args.recall_sample, seed=seed)
+                    recall_sample, seed=seed)
                 seed_result["recall_at_k"] = round(recall, 6)
                 print(f"  recall@{args.k}   : {recall:.4f}  (sampled {n_sampled} queries)")
             per_seed.append(seed_result)
@@ -459,52 +585,82 @@ def main():
             build_t, search_t, indices = ivf_flat_search(
                 database, queries, args.k,
                 args.ivf_nlist, args.ivf_nprobe,
+                run_search=run_search,
             )
             print(f"  build_time : {build_t:.4f} s")
-            print(f"  search_time: {search_t:.4f} s")
             seed_result = {
                 "seed": seed,
                 "build_time_s": round(build_t, 6),
-                "search_time_s": round(search_t, 6),
             }
-            if args.recall_sample > 0:
+            if run_search:
+                print(f"  search_time: {search_t:.4f} s")
+                seed_result["search_time_s"] = round(search_t, 6)
+            if run_search and recall_sample > 0:
                 recall, n_sampled = estimate_recall(
                     database, queries, indices, args.k,
-                    args.recall_sample, seed=seed)
+                    recall_sample, seed=seed)
                 seed_result["recall_at_k"] = round(recall, 6)
                 print(f"  recall@{args.k}   : {recall:.4f}  (sampled {n_sampled} queries)")
             per_seed.append(seed_result)
 
         elif args.algorithm == "cagra":
-            build_t, search_t, indices = cagra_search(
+            build_t, search_t, indices, memory_stats = cagra_search(
                 database, queries, args.k,
                 args.cagra_graph_degree,
                 args.cagra_intermediate_graph_degree,
                 args.cagra_itopk_size,
                 args.cagra_build_algo,
+                run_search=run_search,
+                track_memory=True,
             )
             print(f"  build_time : {build_t:.4f} s")
-            print(f"  search_time: {search_t:.4f} s")
             seed_result = {
                 "seed": seed,
                 "build_time_s": round(build_t, 6),
-                "search_time_s": round(search_t, 6),
             }
-            if args.recall_sample > 0:
+            seed_result.update(memory_stats)
+            if "index_memory_bytes" in memory_stats:
+                print(f"  index_mem  : {memory_stats['index_memory_bytes'] / 1e6:.2f} MB")
+                print(f"  peak_build : {memory_stats['peak_build_memory_bytes'] / 1e6:.2f} MB")
+            if run_search:
+                print(f"  search_time: {search_t:.4f} s")
+                seed_result["search_time_s"] = round(search_t, 6)
+            if run_search and recall_sample > 0:
                 recall, n_sampled = estimate_recall(
                     database, queries, indices, args.k,
-                    args.recall_sample, seed=seed)
+                    recall_sample, seed=seed)
                 seed_result["recall_at_k"] = round(recall, 6)
                 print(f"  recall@{args.k}   : {recall:.4f}  (sampled {n_sampled} queries)")
             per_seed.append(seed_result)
 
+        del database
+        del queries
+        del db_idx
+        del query_idx
+
     # --- Compute means ---
-    mean_search = sum(r["search_time_s"] for r in per_seed) / len(per_seed)
+    build_values = [r["build_time_s"] for r in per_seed if "build_time_s" in r]
+    search_values = [r["search_time_s"] for r in per_seed if "search_time_s" in r]
     recall_values = [r["recall_at_k"] for r in per_seed if "recall_at_k" in r]
+    index_memory_values = [r["index_memory_bytes"] for r in per_seed if "index_memory_bytes" in r]
+    peak_build_memory_values = [
+        r["peak_build_memory_bytes"] for r in per_seed if "peak_build_memory_bytes" in r
+    ]
+
+    mean_build = sum(build_values) / len(build_values) if build_values else None
+    mean_search = sum(search_values) / len(search_values) if search_values else None
     mean_recall = sum(recall_values) / len(recall_values) if recall_values else None
+    mean_index_memory = (
+        sum(index_memory_values) / len(index_memory_values) if index_memory_values else None
+    )
+    mean_peak_build_memory = (
+        sum(peak_build_memory_values) / len(peak_build_memory_values)
+        if peak_build_memory_values else None
+    )
 
     result = {
         "algorithm": args.algorithm,
+        "mode": "build_only" if args.build_only else "build_and_search",
         "dataset": info["name"],
         "dimension": info["dimension"],
         "num_database_vectors": num_db,
@@ -514,9 +670,12 @@ def main():
         "seeds": args.seeds,
         "num_seeds": len(args.seeds),
         "per_seed": per_seed,
-        "mean_search_time_s": round(mean_search, 6),
         "timestamp": datetime.now().isoformat(timespec="seconds"),
     }
+    if mean_build is not None:
+        result["mean_build_time_s"] = round(mean_build, 6)
+    if mean_search is not None:
+        result["mean_search_time_s"] = round(mean_search, 6)
 
     if args.algorithm == "hnsw":
         result["parameters"] = {
@@ -524,16 +683,12 @@ def main():
             "efConstruction": args.hnsw_ef_construction,
             "efSearch": args.hnsw_ef_search,
         }
-        mean_build = sum(r["build_time_s"] for r in per_seed) / len(per_seed)
-        result["mean_build_time_s"] = round(mean_build, 6)
 
     elif args.algorithm == "ivf_flat":
         result["parameters"] = {
             "nlist": args.ivf_nlist,
             "nprobe": args.ivf_nprobe,
         }
-        mean_build = sum(r["build_time_s"] for r in per_seed) / len(per_seed)
-        result["mean_build_time_s"] = round(mean_build, 6)
 
     elif args.algorithm == "cagra":
         result["parameters"] = {
@@ -542,17 +697,24 @@ def main():
             "itopk_size": args.cagra_itopk_size,
             "build_algo": args.cagra_build_algo,
         }
-        mean_build = sum(r["build_time_s"] for r in per_seed) / len(per_seed)
-        result["mean_build_time_s"] = round(mean_build, 6)
+        if mean_index_memory is not None:
+            result["mean_index_memory_bytes"] = int(round(mean_index_memory))
+        if mean_peak_build_memory is not None:
+            result["mean_peak_build_memory_bytes"] = int(round(mean_peak_build_memory))
 
     if mean_recall is not None:
         result["mean_recall_at_k"] = round(mean_recall, 6)
 
     # --- Print summary ---
     print(f"\n{'=' * 50}")
-    print(f"  Mean search time : {mean_search:.4f} s")
-    if args.algorithm in ("hnsw", "ivf_flat", "cagra"):
+    if mean_build is not None:
         print(f"  Mean build time  : {mean_build:.4f} s")
+    if mean_search is not None:
+        print(f"  Mean search time : {mean_search:.4f} s")
+    if mean_index_memory is not None:
+        print(f"  Mean index mem   : {mean_index_memory / 1e6:.2f} MB")
+    if mean_peak_build_memory is not None:
+        print(f"  Mean peak build  : {mean_peak_build_memory / 1e6:.2f} MB")
     if mean_recall is not None:
         print(f"  Mean recall@{args.k}   : {mean_recall:.4f}")
     print(f"{'=' * 50}")
@@ -560,7 +722,8 @@ def main():
     # --- Write result file ---
     os.makedirs(RESULTS_DIR, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = f"{args.algorithm}_{args.dataset}_db{num_db}_nq{args.num_queries}_{ts}.json"
+    mode_tag = "buildonly" if args.build_only else "full"
+    filename = f"{args.algorithm}_{args.dataset}_db{num_db}_nq{args.num_queries}_{mode_tag}_{ts}.json"
     filepath = os.path.join(RESULTS_DIR, filename)
 
     with open(filepath, "w") as f:
